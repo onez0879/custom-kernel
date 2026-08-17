@@ -1,0 +1,235 @@
+# ==========================================================================
+# Build Flippy 6.18 kernel + external RTL8189FS module
+# RTL8189FS/FTV SDIO: 024C:F179
+# ==========================================================================
+
+name: Build 6.18 Flippy + RTL8189FS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        description: "Kernel source owner"
+        required: false
+        default: "ophub"
+        type: choice
+        options:
+          - ophub
+          - unifreq
+          - codesnas
+      kernel_branch:
+        description: "Kernel source branch"
+        required: false
+        default: "main"
+      kernel_auto:
+        description: "Use latest 6.18.y"
+        required: false
+        default: true
+        type: boolean
+      kernel_toolchain:
+        description: "Kernel toolchain"
+        required: false
+        default: "gcc"
+        type: choice
+        options:
+          - gcc
+          - gcc-15.3
+          - gcc-15.2
+          - gcc-14.3
+          - gcc-14.2
+      docker_image:
+        description: "Armbian build image"
+        required: false
+        default: "resolute"
+        type: choice
+        options:
+          - resolute
+          - noble
+          - trixie
+          - bookworm
+
+env:
+  TZ: Etc/UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl jq tar gzip xz-utils \
+            bc bison flex libssl-dev \
+            build-essential kmod
+
+      - name: Create build disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$((root_avail - 4))
+          [ "$root_size" -gt 0 ] || {
+            echo "Not enough disk space"
+            exit 1
+          }
+
+          sudo truncate -s "${root_size}G" /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "$build_dev"
+          sudo mkdir -p /builder
+          sudo mount "$build_dev" /builder
+          sudo chown -R runner:runner /builder
+
+      - name: Compile 6.18 kernel
+        uses: ophub/amlogic-s9xxx-armbian@main
+        with:
+          build_target: kernel
+          kernel_source: ${{ inputs.kernel_source }}@${{ inputs.kernel_branch }}
+          kernel_version: 6.18.y
+          kernel_auto: ${{ inputs.kernel_auto }}
+          kernel_package: all
+          kernel_toolchain: ${{ inputs.kernel_toolchain }}
+          kernel_config: kernel-config/release/stable
+          kernel_patch: kernel-patch/beta
+          auto_patch: true
+          kernel_sign: -rtl8189fs
+          delete_source: false
+          docker_hostpath: /builder
+          docker_image: ophub/armbian-${{ inputs.docker_image }}:arm64
+
+      - name: Build RTL8189FS module against the same kernel
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "PACKAGED_OUTPUTPATH=${PACKAGED_OUTPUTPATH}"
+
+          # Find the kernel source retained by delete_source=false.
+          KSRC="$(find /builder -type f -name .config -printf '%h\n' 2>/dev/null \
+            | grep -E '/linux-6\.18(\.y)?$|/linux-6\.18[^/]*/' \
+            | head -n 1 || true)"
+
+          if [ -z "$KSRC" ]; then
+            KSRC="$(find /builder -type f -name .config -printf '%h\n' 2>/dev/null | head -n 1 || true)"
+          fi
+
+          [ -n "$KSRC" ] && [ -f "$KSRC/Makefile" ] || {
+            echo "Kernel source not found."
+            find /builder -maxdepth 5 -type f -name .config -print || true
+            exit 1
+          }
+
+          echo "Using kernel source: $KSRC"
+
+          # The current rtl8189fs branch contains recent Linux compatibility
+          # fixes and is maintained upstream.
+          rm -rf /builder/rtl8189fs
+          git clone --depth=1 --branch rtl8189fs \
+            https://github.com/jwrdegoede/rtl8189ES_linux.git \
+            /builder/rtl8189fs
+
+          cd /builder/rtl8189fs
+
+          export ARCH=arm64
+          export KSRC="$KSRC"
+          export M="$PWD"
+
+          # The ARM64 runner can normally build natively.
+          # Prefer the cross compiler if one is present.
+          if command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
+            export CROSS_COMPILE="aarch64-none-linux-gnu-"
+            export CC="${CROSS_COMPILE}gcc"
+            export LD="${CROSS_COMPILE}ld.bfd"
+          fi
+
+          # Build as an external module, exactly as documented by ophub.
+          make -j"$(nproc)" \
+            ARCH="$ARCH" \
+            KSRC="$KSRC" \
+            CONFIG_RTL8189FS=m
+
+          MOD="$(find "$PWD" -maxdepth 2 -type f -name '*.ko' | head -n 1)"
+          [ -n "$MOD" ] || {
+            echo "RTL8189FS module was not produced."
+            find "$PWD" -type f -name '*.ko' -print
+            exit 1
+          }
+
+          echo "Built module: $MOD"
+
+          # Record the module for an independent artifact.
+          mkdir -p /builder/rtl8189fs-output
+          cp -f "$MOD" /builder/rtl8189fs-output/
+
+          # Add the module into the kernel modules tarball produced by ophub.
+          MODULE_TAR="$(find "$PACKAGED_OUTPUTPATH" -type f -name 'modules-*.tar.gz' | head -n 1)"
+          [ -n "$MODULE_TAR" ] || {
+            echo "Kernel modules tarball not found."
+            find "$PACKAGED_OUTPUTPATH" -maxdepth 2 -type f -print
+            exit 1
+          }
+
+          KVER="$(make -s -C "$KSRC" kernelversion)"
+          TMP="$(mktemp -d)"
+          tar -xzf "$MODULE_TAR" -C "$TMP"
+
+          MODROOT="$TMP/lib/modules/$KVER"
+          [ -d "$MODROOT" ] || {
+            echo "Expected module root not found: $MODROOT"
+            find "$TMP/lib/modules" -maxdepth 3 -type d -print || true
+            exit 1
+          }
+
+          mkdir -p "$MODROOT/kernel/drivers/net/wireless"
+          cp -f "$MOD" "$MODROOT/kernel/drivers/net/wireless/"
+
+          # Regenerate dependency metadata if possible.
+          depmod -b "$TMP" "$KVER" || true
+
+          tar -czf "${MODULE_TAR}.new" -C "$TMP" .
+          mv -f "${MODULE_TAR}.new" "$MODULE_TAR"
+          rm -rf "$TMP"
+
+          echo "RTL8189FS added to: $MODULE_TAR"
+
+      - name: Package standalone RTL8189FS module
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        run: |
+          cd /builder
+          tar -czf "${GITHUB_WORKSPACE}/rtl8189fs-module.tar.gz" \
+            -C rtl8189fs-output .
+
+      - name: Upload kernel and RTL8189FS artifacts
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-6.18-rtl8189fs
+          path: |
+            ${{ env.PACKAGED_OUTPUTPATH }}/*
+            rtl8189fs-module.tar.gz
+
+      - name: Upload to kernel_beta release
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: kernel_beta
+          artifacts: |
+            ${{ env.PACKAGED_OUTPUTPATH }}/*
+            rtl8189fs-module.tar.gz
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - 6.18 Flippy kernel with external RTL8189FS/FTV SDIO module.
+            - Target SDIO ID: 024C:F179.
+            - The RTL8189FS module is built against the same kernel source/config.
