@@ -49,7 +49,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl jq tar gzip xz-utils bc bison flex libssl-dev build-essential kmod
+          sudo apt-get install -y git curl jq tar gzip xz-utils bc bison flex libssl-dev build-essential kmod dwarves
 
       - name: Create build disk
         run: |
