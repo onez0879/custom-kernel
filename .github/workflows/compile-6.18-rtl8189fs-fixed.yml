@@ -163,19 +163,57 @@ jobs:
           mkdir -p /builder/rtl8189fs-output
           cp -f "$MOD" /builder/rtl8189fs-output/8189fs.ko
 
-          MODULE_TAR="$(find "$PACKAGED_OUTPUTPATH" -type f -name 'modules-*.tar.gz' | head -n 1)"
-          [ -n "$MODULE_TAR" ] || { echo "modules tarball not found"; exit 1; }
-          KVER="$(make -s -C "$KSRC" kernelversion)"
-          TMP="$(mktemp -d)"
-          tar -xzf "$MODULE_TAR" -C "$TMP"
-          MODROOT="$TMP/lib/modules/$KVER"
-          [ -d "$MODROOT" ] || { echo "Module root missing: $MODROOT"; exit 1; }
-          mkdir -p "$MODROOT/kernel/drivers/net/wireless"
-          cp -f "$MOD" "$MODROOT/kernel/drivers/net/wireless/8189fs.ko"
-          depmod -b "$TMP" "$KVER" || true
-          tar -czf "${MODULE_TAR}.new" -C "$TMP" .
-          mv -f "${MODULE_TAR}.new" "$MODULE_TAR"
-          rm -rf "$TMP"
+MODULE_TAR="$(find /builder -type f -name 'modules-*.tar.gz' | head -n 1)"
+
+if [ -z "$MODULE_TAR" ]; then
+    echo "ERROR: modules tarball not found."
+    echo "Available kernel artifacts:"
+    find /builder -type f \( \
+        -name '*.tar.gz' -o \
+        -name '*.tar.xz' -o \
+        -name '*.deb' \
+    \) -print
+    exit 1
+fi
+
+echo "Using modules tarball:"
+echo "$MODULE_TAR"
+
+KVER="$(make -s -C "$KSRC" kernelversion)"
+TMP="$(mktemp -d)"
+
+tar -xzf "$MODULE_TAR" -C "$TMP"
+
+MODROOT="$TMP/lib/modules/$KVER"
+
+if [ ! -d "$MODROOT" ]; then
+    MODROOT="$(find "$TMP/lib/modules" \
+        -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
+fi
+
+[ -n "$MODROOT" ] && [ -d "$MODROOT" ] || {
+    echo "ERROR: module root not found."
+    find "$TMP" -maxdepth 4 -type d -print
+    exit 1
+}
+
+echo "Using module root:"
+echo "$MODROOT"
+
+mkdir -p "$MODROOT/kernel/drivers/net/wireless"
+
+cp -f "$MOD" \
+    "$MODROOT/kernel/drivers/net/wireless/8189fs.ko"
+
+depmod -b "$TMP" "$KVER" || true
+
+tar -czf "${MODULE_TAR}.new" -C "$TMP" .
+mv -f "${MODULE_TAR}.new" "$MODULE_TAR"
+
+rm -rf "$TMP"
+
+echo "RTL8189FS successfully added to:"
+echo "$MODULE_TAR"
 
       - name: Package standalone RTL8189FS module
         if: ${{ env.PACKAGED_STATUS == 'success' }}
