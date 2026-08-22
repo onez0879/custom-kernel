@@ -98,15 +98,45 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          
           p = Path("os_dep/linux/ioctl_cfg80211.c")
           s = p.read_text()
+          
+          # cfg80211 API compatibility: Linux 6.18
           old = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0))"
           new = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))"
+          
           n = s.count(old)
           print(f"Found {n} cfg80211 7.1 guards")
+          
           if n == 0:
               raise SystemExit("No cfg80211 7.1 guards found")
-          p.write_text(s.replace(old, new))
+          
+          s = s.replace(old, new)
+          
+          # Linux 6.18 adds rx_addr to remain_on_channel().
+          old_sig = """static s32 cfg80211_rtw_remain_on_channel(struct wiphy *wiphy,
+          	struct wireless_dev *wdev,
+          	struct ieee80211_channel *channel,
+          	unsigned int duration,
+          	u64 *cookie)"""
+          
+          new_sig = """static int cfg80211_rtw_remain_on_channel(struct wiphy *wiphy,
+          	struct wireless_dev *wdev,
+          	struct ieee80211_channel *channel,
+          	unsigned int duration,
+          	u64 *cookie,
+          	const u8 *rx_addr)"""
+          
+          if old_sig not in s:
+              print("WARNING: old remain_on_channel signature not found")
+              start = s.find("static s32 cfg80211_rtw_remain_on_channel")
+              print(s[start:start+500] if start >= 0 else "function not found")
+          else:
+              s = s.replace(old_sig, new_sig)
+              print("remain_on_channel signature patched")
+          
+          p.write_text(s)
           PY
 
           export ARCH=arm64
