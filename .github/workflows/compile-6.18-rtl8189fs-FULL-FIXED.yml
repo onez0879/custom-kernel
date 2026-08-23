@@ -1,0 +1,195 @@
+name: Build 6.18 Flippy + RTL8189FS
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        description: Kernel source owner
+        required: false
+        default: ophub
+        type: choice
+        options: [ophub, unifreq, codesnas]
+      kernel_branch:
+        description: Kernel source branch
+        required: false
+        default: main
+      kernel_auto:
+        description: Use latest 6.18.y
+        required: false
+        default: true
+        type: boolean
+      kernel_toolchain:
+        description: Kernel toolchain
+        required: false
+        default: gcc
+        type: choice
+        options: [gcc, gcc-15.3, gcc-15.2, gcc-14.3, gcc-14.2]
+      docker_image:
+        description: Armbian build image
+        required: false
+        default: resolute
+        type: choice
+        options: [resolute, noble, trixie, bookworm]
+
+env:
+  TZ: Etc/UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl jq tar gzip xz-utils bc bison flex libssl-dev build-essential kmod dwarves
+
+      - name: Create build disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$((root_avail - 4))
+          [ "$root_size" -gt 0 ] || exit 1
+          sudo truncate -s "${root_size}G" /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "$build_dev"
+          sudo mkdir -p /builder
+          sudo mount "$build_dev" /builder
+          sudo chown -R runner:runner /builder
+
+      - name: Compile 6.18 kernel
+        uses: ophub/amlogic-s9xxx-armbian@main
+        with:
+          build_target: kernel
+          kernel_source: ${{ inputs.kernel_source }}@${{ inputs.kernel_branch }}
+          kernel_version: 6.18.y
+          kernel_auto: ${{ inputs.kernel_auto }}
+          kernel_package: all
+          kernel_toolchain: ${{ inputs.kernel_toolchain }}
+          kernel_config: kernel-config/release/stable
+          kernel_patch: kernel-patch/beta
+          auto_patch: true
+          kernel_sign: -rtl8189fs
+          delete_source: false
+          docker_hostpath: /builder
+          docker_image: ophub/armbian-${{ inputs.docker_image }}:arm64
+
+      - name: Build RTL8189FS module against the same kernel
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          KSRC="$(find /builder -type f -name .config -printf '%h\n' 2>/dev/null | grep -E '/linux-6\.18(\.y)?$|/linux-6\.18[^/]*/' | head -n 1 || true)"
+          [ -n "$KSRC" ] || KSRC="$(find /builder -type f -name .config -printf '%h\n' 2>/dev/null | head -n 1 || true)"
+          [ -n "$KSRC" ] && [ -f "$KSRC/Makefile" ] || { echo "Kernel source not found"; find /builder -type f -name .config -print || true; exit 1; }
+
+          KVER="$(make -s -C "$KSRC" kernelversion)"
+          echo "Using kernel source: $KSRC"
+          echo "Kernel version: $KVER"
+
+          rm -rf /builder/rtl8189fs
+          git clone --depth=1 --branch rtl8189fs https://github.com/jwrdegoede/rtl8189ES_linux.git /builder/rtl8189fs
+          cd /builder/rtl8189fs
+
+          python3 - <<'PY'
+          from pathlib import Path
+          
+          p = Path("os_dep/linux/ioctl_cfg80211.c")
+          s = p.read_text()
+          
+          # cfg80211 API compatibility: Linux 6.18
+          old = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0))"
+          new = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))"
+          
+          n = s.count(old)
+          print(f"Found {n} cfg80211 7.1 guards")
+          
+          if n == 0:
+              raise SystemExit("No cfg80211 7.1 guards found")
+          
+          s = s.replace(old, new)
+          
+          # Linux 6.18 adds rx_addr to remain_on_channel().
+          old_sig = """static int cfg80211_rtw_remain_on_channel(struct wiphy *wiphy,
+          	struct wireless_dev *wdev,
+          	struct ieee80211_channel *channel,
+          	unsigned int duration,
+          	u64 *cookie)"""
+          
+          new_sig = """static int cfg80211_rtw_remain_on_channel(struct wiphy *wiphy,
+          	struct wireless_dev *wdev,
+          	struct ieee80211_channel *channel,
+          	unsigned int duration,
+          	u64 *cookie,
+          	const u8 *rx_addr)"""
+          
+          if old_sig not in s:
+              print("WARNING: old remain_on_channel signature not found")
+              start = s.find("static s32 cfg80211_rtw_remain_on_channel")
+              print(s[start:start+500] if start >= 0 else "function not found")
+          else:
+              s = s.replace(old_sig, new_sig)
+              print("remain_on_channel signature patched")
+          
+          p.write_text(s)
+          PY
+
+          export ARCH=arm64
+          export KSRC="$KSRC"
+          export M="$PWD"
+
+          if command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
+            export CROSS_COMPILE="aarch64-none-linux-gnu-"
+            export CC="${CROSS_COMPILE}gcc"
+            export LD="${CROSS_COMPILE}ld.bfd"
+          fi
+
+          command -v pahole || { echo "pahole missing"; exit 1; }
+          pahole --version
+
+          make -j"$(nproc)" ARCH="$ARCH" KSRC="$KSRC" CONFIG_RTL8189FS=m
+
+          MOD="$(find "$PWD" -maxdepth 3 -type f -name '8189fs.ko' | head -n 1)"
+          [ -n "$MOD" ] || { echo "8189fs.ko was not produced"; find "$PWD" -type f -name '*.ko' -print; exit 1; }
+
+          echo "Built module: $MOD"
+          mkdir -p /builder/rtl8189fs-output
+          cp -f "$MOD" /builder/rtl8189fs-output/8189fs.ko
+
+          echo "Standalone RTL8189FS module ready: /builder/rtl8189fs-output/8189fs.ko"
+
+      - name: Package standalone RTL8189FS module
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        run: |
+          tar -czf "${GITHUB_WORKSPACE}/rtl8189fs-module.tar.gz" -C /builder/rtl8189fs-output 8189fs.ko
+
+      - name: Upload kernel and RTL8189FS artifacts
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-6.18-rtl8189fs
+          path: |
+            ${{ env.PACKAGED_OUTPUTPATH }}/*
+            rtl8189fs-module.tar.gz
+
+      - name: Upload to kernel_beta release
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: kernel_beta
+          artifacts: |
+            ${{ env.PACKAGED_OUTPUTPATH }}/*
+            rtl8189fs-module.tar.gz
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            6.18 Flippy kernel + patched RTL8189FS/FTV SDIO module
+            SDIO ID: 024C:F179
