@@ -98,65 +98,52 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           p = Path("os_dep/linux/ioctl_cfg80211.c")
           s = p.read_text()
 
-          print("=== RTL8189FS cfg80211 compatibility patch ===")
+          print("=== RTL8189FS cfg80211 Linux 6.18 patch ===")
 
-          # Linux 6.18 already uses wireless_dev for these cfg80211 callbacks.
-          guard = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0))"
-          count = s.count(guard)
-          print(f"Found {count} cfg80211 7.1 guards")
-          if count:
-              s = s.replace(
-                  guard,
-                  "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))"
+          # Existing driver switches wireless_dev API at kernel 7.1.
+          old = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0))"
+          new = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))"
+
+          n1 = s.count(old)
+          print(f"7.1 guards: {n1}")
+
+          if n1:
+              s = s.replace(old, new)
+
+          # remain_on_channel() gets rx_addr starting at 7.2 in the
+          # upstream driver. Linux 6.18 already requires this argument.
+          old = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0))"
+          new = "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))"
+
+          n2 = s.count(old)
+          print(f"7.2 rx_addr guards: {n2}")
+
+          if n2 == 0:
+              raise SystemExit("ERROR: remain_on_channel 7.2 guard not found")
+
+          s = s.replace(old, new)
+
+          # cfg80211_ops expects int, not s32, for remain_on_channel.
+          old = "static s32 cfg80211_rtw_remain_on_channel"
+          new = "static int cfg80211_rtw_remain_on_channel"
+
+          n3 = s.count(old)
+          print(f"remain_on_channel return type: {n3}")
+
+          if n3 != 1:
+              raise SystemExit(
+                  "ERROR: unexpected remain_on_channel definition count"
               )
 
-          # Linux 6.18 adds rx_addr to remain_on_channel() and expects int.
-          # Match the actual source, including its preprocessor conditionals.
-          roc = re.compile(
-              r"static\s+(?:s32|int)\s+cfg80211_rtw_remain_on_channel\s*\(\s*"
-              r"struct\s+wiphy\s*\*wiphy\s*,\s*"
-              r"#if\s*\(LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\(3,\s*6,\s*0\)\)\s*"
-              r"struct\s+wireless_dev\s*\*wdev\s*,\s*"
-              r"#else\s*"
-              r"struct\s+net_device\s*\*ndev\s*,\s*"
-              r"#endif\s*"
-              r"struct\s+ieee80211_channel\s*\*channel\s*,\s*"
-              r"(?:#if\s*\(LINUX_VERSION_CODE\s*<\s*KERNEL_VERSION\(3,\s*8,\s*0\)\)\s*"
-              r"enum\s+nl80211_channel_type\s+channel_type\s*,\s*#endif\s*)?"
-              r"unsigned\s+int\s+duration\s*,\s*u64\s*\*cookie\s*\)",
-              re.S
-          )
-
-          replacement = """static int cfg80211_rtw_remain_on_channel(struct wiphy *wiphy,
-          #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
-              struct wireless_dev *wdev,
-          #else
-              struct net_device *ndev,
-          #endif
-              struct ieee80211_channel *channel,
-          #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0))
-              enum nl80211_channel_type channel_type,
-          #endif
-              unsigned int duration, u64 *cookie,
-              const u8 *rx_addr)"""
-
-          s, n = roc.subn(replacement, s, count=1)
-          print(f"remain_on_channel definition patched: {n}")
-
-          if n != 1:
-              start = s.find("static s32 cfg80211_rtw_remain_on_channel")
-              if start < 0:
-                  start = s.find("static int cfg80211_rtw_remain_on_channel")
-              print(s[start:start+700] if start >= 0 else "function not found")
-              raise SystemExit("ERROR: remain_on_channel definition not matched")
+          s = s.replace(old, new, 1)
 
           p.write_text(s)
-          print("=== Patch complete ===")
+
+          print("=== Patch successful ===")
           PY
 
           export ARCH=arm64
