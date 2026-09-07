@@ -166,7 +166,8 @@ jobs:
           "${CC:-gcc}" --version | head -n 1 || true
 
           echo "=== Prepare kernel module build ==="
-          make -C "$KSRC" ARCH="$ARCH" modules_prepare
+          sudo chown -R "$(id -u):$(id -g)" "$KSRC"
+                    make -C "$KSRC" ARCH="$ARCH" modules_prepare
 
           echo "=== Build RTL8189FS ==="
           make -j"$(nproc)" ARCH="$ARCH" KSRC="$KSRC" CONFIG_RTL8189FS=m
